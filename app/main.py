@@ -9,6 +9,7 @@
   POST   /api/drill                    关阀隔离预演（只读，不写入）
   GET    /api/status                   当前真实阀位下的分派结果（含 revision）
   POST   /api/derating/preview         抢修降额影响预演（只读；同快照对比现状/降额两种情景）
+  POST   /api/storage/preview          多时段有限储水供水调度预演（只读；逐期补水/分配/扣减）
   POST   /api/restore/plans            复水逐步预演；全部安全才保存不可变计划
   GET    /api/restore/plans            计划列表
   GET    /api/restore/plans/{plan_id}  计划详情（步骤与进度）
@@ -37,6 +38,7 @@ from .engine import (
 )
 from . import plans as plans_svc
 from . import derating as derating_svc
+from . import storage as storage_svc
 from .repository import (
     get_plan,
     get_step_result,
@@ -54,6 +56,7 @@ from .schemas import (
     NetworkLoad,
     PlanExecuteRequest,
     RestorePlanRequest,
+    StoragePreviewRequest,
     ValveChangeBatch,
 )
 
@@ -133,6 +136,7 @@ def root():
             "PUT /api/network", "GET /api/network", "DELETE /api/network",
             "POST /api/valves/change", "POST /api/drill", "GET /api/status",
             "POST /api/derating/preview",
+            "POST /api/storage/preview",
             "POST /api/restore/plans", "GET /api/restore/plans",
             "GET /api/restore/plans/{plan_id}",
             "POST /api/restore/plans/{plan_id}/execute",
@@ -422,6 +426,59 @@ def derating_preview(payload: DeratingPreviewRequest, conn=Depends(get_conn)):
         return derating_svc.preview(
             network, current_revision, source_items, pipe_items
         )
+
+
+# --------------------------------------------------------------------------- #
+# 多时段有限储水供水调度预演（只读，不写入状态/阀位/计划/修订号）
+# --------------------------------------------------------------------------- #
+@app.post("/api/storage/preview")
+def storage_preview(payload: StoragePreviewRequest, conn=Depends(get_conn)):
+    """连续等长时段内有限储水的供水情况试算。
+
+    - 必须携带当前所见修订号；过期整单 409 拒绝，不返回任何预演结果；
+    - 各水源初始储水与库容须恰好覆盖全部水源，且初始储水不得超过库容；
+    - 每期须恰好列出所有水源的补水量与所有用水点的需求量；
+      未知/错类设施、重复或缺失条目一次性带定位 400 拒绝；
+    - 每期先补水至库容（超出计溢出），再按现有阀位、单向管段、共享容量
+      与用水点优先级分配；水源本期出水不超过额定上限与可用储水，
+      实际出水扣减储水，欠供不结转；
+    - 预演只读：不改变管网、阀位、计划或修订号。
+    """
+    # 读取与逐期试算在同一把写锁内完成，保证基于同一已提交快照，
+    # 不会与录入/阀变/复水执行等写事务穿插而产生混合版本结果。
+    with _write_lock:
+        network = load_network(conn)
+        if network is None:
+            return error_response(
+                409, "network_not_initialized",
+                "尚未录入管网数据，请先调用 PUT /api/network",
+            )
+        current_revision = get_revision(conn)
+        if payload.revision != current_revision:
+            return error_response(
+                409, "revision_conflict",
+                f"修订号已过期：所见 {payload.revision}，当前 {current_revision}；"
+                "请重新查询当前管网后重试，本次未做任何预演",
+                [{
+                    "location": "revision",
+                    "code": "stale_revision",
+                    "seen_revision": payload.revision,
+                    "current_revision": current_revision,
+                }],
+            )
+
+        dumped = payload.model_dump()
+        config, periods, errs = storage_svc.validate_storage(
+            network, dumped["sources"], dumped["periods"]
+        )
+        if errs:
+            return error_response(
+                400, "invalid_storage",
+                "储水调度预演参数校验失败，整单已拒绝（未做任何预演、未改变状态）",
+                errs,
+            )
+
+        return storage_svc.preview(network, current_revision, config, periods)
 
 
 # --------------------------------------------------------------------------- #

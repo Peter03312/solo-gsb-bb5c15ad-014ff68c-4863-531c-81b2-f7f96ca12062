@@ -5,6 +5,9 @@
 **整批校验、原子生效**，并在**不写入状态**的前提下预演关阀后各用水点的供水分配。
 抢修前还可提交水源（泵站）与管段的**临时容量上限**与当前管网修订号，由服务以**同一快照**
 对比“现状 / 降额”两种分配情景，返回各用水点获水变化与降额设施占用（只读、不推进修订号）。
+调度员还可提交各水源的**初始储水与库容**及**非空有序时段**（每期恰好列出所有水源补水量与
+所有用水点需求量），预演连续等长时段内**有限储水**的供水情况：每期先补水至库容（超出计溢出），
+再按现有阀位与优先级分配，水源出水不超过额定上限与可用储水，欠供不结转（只读、不推进修订号）。
 
 复水时必须按**阀门操作清单逐步恢复**：服务对开/关步骤做逐步预演（每一步都按无向开启管段
 复核互锁水源），全部安全才保存**不可变计划**；执行端携带**基准修订号**逐步提交，服务在同一
@@ -51,7 +54,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 bash examples/demo.sh                 # 关阀隔离预演（原能力），默认 http://localhost:8080
 bash examples/demo.sh http://主机:端口
 bash examples/restore_demo.sh         # 复水计划：逐步预演 → 保存 → 修订号逐步执行
-bash examples/derating_demo.sh        # 抢修降额：同快照对比现状/降额两种情景（本轮新增）
+bash examples/derating_demo.sh        # 抢修降额：同快照对比现状/降额两种情景
+bash examples/storage_demo.sh         # 多时段有限储水：逐期补水/分配/扣减预演（本轮新增）
 ```
 
 ---
@@ -116,6 +120,7 @@ Compose 的端口映射在 `docker-compose.yml` 中修改左侧即可（如 `"18
 | POST | `/api/valves/change` | 阀门**整批变更**（原子生效；成功 `revision+1`，未完计划失效） |
 | POST | `/api/drill` | 关阀隔离**预演**（只读，不写入） |
 | POST | `/api/derating/preview` | 抢修**降额影响预演**：水源/管段临时容量上限，同快照对比现状/降额（只读） |
+| POST | `/api/storage/preview` | **多时段有限储水**供水调度预演：逐期补水（溢出）→ 分配 → 扣减储水（只读） |
 | GET | `/api/status` | 当前真实阀位下的分派结果（含 `revision`） |
 | POST | `/api/restore/plans` | 复水**逐步预演**；全部安全才保存不可变计划 |
 | GET | `/api/restore/plans` | 计划列表（状态/进度） |
@@ -364,7 +369,115 @@ curl -X POST http://localhost:8080/api/derating/preview \
 端到端示例见 [`examples/derating_demo.sh`](examples/derating_demo.sh)
 （空清单一致、水源降额、管段+水源组合降额、停输 0 上限、越额/未知/错类别/重复、过期修订号、预演不写入）。
 
-### 4.5 错误码速查
+### 4.5 多时段有限储水调度预演 `POST /api/storage/preview`
+
+调度员估算**连续等长时段**内**有限储水**的供水情况。请求携带：
+
+- `revision`：**当前管网修订号**（取自 `GET /api/network` 或 `GET /api/status`），
+  过期则整单 409 拒绝，**不返回混合版本结果**；
+- `sources`：各水源的 `initial_storage`（初始储水）与 `storage_capacity`（库容），
+  须**恰好覆盖全部水源**；初始储水**不得超过库容**；
+- `periods`：**非空、有序**（数组顺序即时间顺序）的时段清单；每期须**恰好列出**
+  所有水源的补水量（`replenishment`）和所有用水点的需求量（`demands`）。
+
+每期按固定顺序结算：
+
+1. **补水至库容**：`可用储水 = min(期初储水 + 补水量, 库容)`，超出量计入本期**溢出**；
+2. **分配**：沿用现有阀位、单向管段、共享容量与用水点优先级（与 `/api/status` 同口径），
+   水源本期有效上限 = `min(额定上限, 可用储水)`——出水既不超过额定上限，也不超过可用储水；
+3. **扣减**：实际出水扣减储水得到期末储水，滚入下一期；**欠供不结转**
+   （下期需求以请求中列出的为准，不累计往期缺口）。
+
+```bash
+# revision 先取自 GET /api/network（或 /api/status）
+curl -X POST http://localhost:8080/api/storage/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "revision": 1,
+        "sources": [
+          {"source_id": "S1", "initial_storage": 15, "storage_capacity": 15},
+          {"source_id": "S2", "initial_storage": 5,  "storage_capacity": 8}
+        ],
+        "periods": [
+          {"replenishment": [{"source_id": "S1", "amount": 0},
+                              {"source_id": "S2", "amount": 4}],
+           "demands": [{"demand_id": "D1", "amount": 10},
+                       {"demand_id": "D2", "amount": 8},
+                       {"demand_id": "D3", "amount": 6}]},
+          {"replenishment": [{"source_id": "S1", "amount": 0},
+                              {"source_id": "S2", "amount": 0}],
+           "demands": [{"demand_id": "D1", "amount": 10},
+                       {"demand_id": "D2", "amount": 8},
+                       {"demand_id": "D3", "amount": 6}]}
+        ]
+      }'
+```
+
+响应（节选；`allocations` / `pipe_utilization` 与 `/api/status` 完全同口径）：
+
+```json
+{
+  "message": "储水调度预演完成：逐期结果为内存试算，未改变管网、阀位、计划或修订号",
+  "revision": 1,
+  "closed_valves": ["V5"],
+  "storage_config": [
+    {"source_id": "S1", "rated_capacity": 10.0, "initial_storage": 15.0, "storage_capacity": 15.0},
+    {"source_id": "S2", "rated_capacity": 6.0,  "initial_storage": 5.0,  "storage_capacity": 8.0}
+  ],
+  "periods": [
+    {
+      "period": 1,
+      "replenishment": [{"source_id": "S1", "amount": 0.0}, {"source_id": "S2", "amount": 4.0}],
+      "overflow_total": 1.0,
+      "sources": [
+        {"source_id": "S1", "rated_capacity": 10.0, "storage_capacity": 15.0,
+         "storage_start": 15.0, "replenished": 0.0, "overflow": 0.0,
+         "available": 15.0, "output": 10.0, "storage_end": 5.0},
+        {"source_id": "S2", "rated_capacity": 6.0, "storage_capacity": 8.0,
+         "storage_start": 5.0, "replenished": 4.0, "overflow": 1.0,
+         "available": 8.0, "output": 6.0, "storage_end": 2.0}
+      ],
+      "allocations": ["...各用水点 requested/supplied/shortfall/by_source/受限管段..."],
+      "totals": {"requested": 24.0, "supplied": 16.0, "shortfall": 8.0},
+      "pipe_utilization": ["..."]
+    },
+    {
+      "period": 2,
+      "sources": [
+        {"source_id": "S1", "storage_start": 5.0, "available": 5.0, "output": 5.0, "storage_end": 0.0, "..."},
+        {"source_id": "S2", "storage_start": 2.0, "available": 2.0, "output": 2.0, "storage_end": 0.0, "..."}
+      ],
+      "totals": {"requested": 24.0, "supplied": 7.0, "shortfall": 17.0},
+      "...": "..."
+    }
+  ],
+  "final_storage": [{"source_id": "S1", "storage": 0.0}, {"source_id": "S2", "storage": 0.0}],
+  "totals": {"periods": 2, "requested": 48.0, "supplied": 23.0, "shortfall": 25.0, "overflow": 1.0}
+}
+```
+
+字段含义：
+
+- `sources[i]`（每期）：`storage_start` 期初储水、`replenished` 本期补水、`overflow` 溢出、
+  `available` 补水后可用储水、`rated_capacity` 额定出水上限、`output` 本期实际出水、
+  `storage_end` 期末储水；
+- `overflow_total`：本期全部水源溢出合计；`final_storage`：全程结束后的各水源储水；
+- 顶层 `totals`：全程需求、供水、欠供与溢出汇总（`periods` 为时段数）；
+- 欠供原因码沿用既有口径；储水耗尽导致的限供归入 `SOURCE_LIMIT`
+  （本期有效上限 = min（额定上限， 可用储水））。
+
+校验失败（整单拒绝、不出任何预演结果）：
+
+- `sources` 未知/错类设施、重复条目、缺失条目、初始储水超库容 → 400 `invalid_storage`，
+  带 `sources[i].*` 定位；
+- 某期补水/需求清单未知/错类设施、重复或缺失条目 → 400 `invalid_storage`，
+  带 `periods[i].replenishment[j].*` / `periods[i].demands[j].*` 定位，**多个问题一次性报出**；
+- 负数、NaN/Infinity、空时段清单 → 422；过期修订号 → 409 `revision_conflict`。
+
+端到端示例见 [`examples/storage_demo.sh`](examples/storage_demo.sh)
+（两期滚动耗水、补水恢复、超库容拒绝、条目缺失/重复/未知、过期修订号、预演不写入）。
+
+### 4.6 错误码速查
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
@@ -374,7 +487,8 @@ curl -X POST http://localhost:8080/api/derating/preview \
 | 409 | `forbidden_sources_connected` | 变更/复水某步会使互锁水源经开启管段连通 |
 | 400 | `invalid_drill` | 预演阀门编号未知/重复 |
 | 400 | `invalid_derating` | 降额设施未知、类别错误、同一类别内重复、临时上限超过额定容量（带 `sources[i].*`/`pipes[i].*` 定位） |
-| 409 | `revision_conflict` | 降额预演（或复水执行）携带的修订号已过期；整单拒绝、不返回混合版本结果 |
+| 400 | `invalid_storage` | 储水预演：设施未知/错类、条目重复或缺失、初始储水超库容（带 `sources[i].*`/`periods[i].*` 定位） |
+| 409 | `revision_conflict` | 降额/储水预演（或复水执行）携带的修订号已过期；整单拒绝、不返回混合版本结果 |
 | 400 | `invalid_restore_plan` | 复水步骤含未知阀门、非法动作或重复阀门（带 `steps[i].*` 定位，计划不保存） |
 | 404 | `plan_not_found` | 计划编号不存在 |
 | 409 | `step_out_of_order` | 跳步：提交的不是计划的下一步（状态不变） |
@@ -497,6 +611,8 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
   `revision`，作为下一次执行的“所见修订号”。
 - **降额预演** `POST /api/derating/preview` 是只读操作：必须携带与当前一致的
   `revision`（过期 409，拒绝出混合版本结果），但预演本身**不推进**修订号、不失效任何计划。
+- **储水调度预演** `POST /api/storage/preview` 同为只读操作：修订号规则与降额预演一致，
+  逐期滚动的储水只存在于内存副本中，不推进修订号、不失效任何计划。
 
 > 与旧版的兼容：以上均为**新增字段/新增接口**；`PUT/GET/DELETE /api/network`、
 > `/api/valves/change`、`/api/drill`、`/api/status` 的原有字段与错误码不变，老客户端无需改造。
@@ -508,19 +624,21 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、错误处理、整批事务、复水计划执行、降额预演
+│   ├── main.py        # FastAPI 路由、错误处理、整批事务、复水计划执行、降额/储水预演
 │   ├── engine.py      # 校验、互锁连通(BFS)、Dinic 最大流、优先级贪心预演
 │   ├── derating.py    # 降额条目校验、内存容量叠加、现状/降额同快照对比预演
+│   ├── storage.py     # 多时段储水预演：条目校验、逐期补水(溢出)/分配/扣减滚动
 │   ├── plans.py       # 复水步骤校验、逐步预演、逐步结果快照
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── database.py    # SQLite 连接、建表、修订号
 │   └── repository.py  # DB <-> 内存模型；计划/步骤/结果持久化
-├── tests/             # pytest：端到端 + 引擎测试（含降额预演 test_derating.py）
+├── tests/             # pytest：端到端 + 引擎测试（含降额 test_derating.py、储水 test_storage.py）
 ├── examples/
 │   ├── sample_network.json
 │   ├── demo.sh            # 关阀隔离 curl 端到端示例
 │   ├── restore_demo.sh    # 复水计划 curl 端到端示例
-│   └── derating_demo.sh   # 抢修降额 curl 端到端示例（本轮新增）
+│   ├── derating_demo.sh   # 抢修降额 curl 端到端示例
+│   └── storage_demo.sh    # 多时段有限储水 curl 端到端示例（本轮新增）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -543,6 +661,11 @@ python -m pytest -q
   capacity）上生效；现状与降额两次分派取自同一次快照读取，并在写锁内完成，
   保证不会与并发写操作穿插而产生混合版本结果。容量为 0 的水源/管段按“无可用容量”
   自然参与最大流（拓扑仍可达但流量为 0），与额定容量为 0 的既有语义一致。
+- **储水预演不写入**：逐期滚动的储水只在内存副本上结算（每期把水源有效上限替换为
+  `min(额定上限, 可用储水)`、把用水点需求替换为本期值后调用同一 `simulate`），
+  读取与全部时段的试算在同一把写锁内完成；管网、阀位、计划、修订号均不变。
+  每期“补水至库容、溢出、出水扣减”按 1e-9 容差做浮点结算并保留 9 位小数，
+  与引擎既有口径一致；欠供不结转，下期需求完全以请求列出值为准。
 - **复水预演不写入**：逐步开/关只在内存中的 `Network` 副本上叠加，库内阀位不变；
   计划保存只写入 `plans/plan_steps`，也不动阀位。
 - **计划不可变**：保存后步骤、动作、顺序不可修改；执行只推进 `status/next_step` 与
