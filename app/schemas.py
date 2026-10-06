@@ -122,6 +122,75 @@ class DeratingPreviewRequest(StrictModel):
     pipes: list[DeratedCapacityIn] = Field(default_factory=list)
 
 
+class ScheduleSourceIn(StrictModel):
+    """调度预演中某水源的初始储水与库容。
+
+    有限非负由本层保证；“初始储水不得超过库容”“必须恰好覆盖所有水源”
+    需要结合已提交管网快照，在服务层逐条定位校验。
+    """
+
+    source_id: str = Field(min_length=1, max_length=64, description="水源编号")
+    initial_storage: float = Field(
+        ge=0, description="期初储水（有限非负，且不得超过库容）"
+    )
+    storage_capacity: float = Field(ge=0, description="库容（有限非负）")
+
+    @field_validator("initial_storage", "storage_capacity")
+    @classmethod
+    def _storage_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class ScheduleReplenishIn(StrictModel):
+    """某水源在某一期的补水量。"""
+
+    source_id: str = Field(min_length=1, max_length=64, description="水源编号")
+    amount: float = Field(ge=0, description="补水量（有限非负）")
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class ScheduleDemandIn(StrictModel):
+    """某用水点在某一期的需求量。"""
+
+    demand_id: str = Field(min_length=1, max_length=64, description="用水点编号")
+    amount: float = Field(ge=0, description="需求量（有限非负）")
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class SchedulePeriodIn(StrictModel):
+    """一个等长时段：恰好列出所有水源的补水量与所有用水点的需求量。
+
+    缺省为空数组；“恰好覆盖、不重复、不错类”由服务层结合管网快照校验。
+    """
+
+    replenishment: list[ScheduleReplenishIn] = Field(default_factory=list)
+    demands: list[ScheduleDemandIn] = Field(default_factory=list)
+
+
+class SchedulePreviewRequest(StrictModel):
+    """多时段有限储水调度预演：携带所见修订号、各水源初始储水与库容、非空有序时段（只读，不写入）。"""
+
+    revision: int = Field(
+        ge=0, description="客户端当前所见管网基准修订号（过期则整单拒绝）"
+    )
+    sources: list[ScheduleSourceIn] = Field(
+        default_factory=list,
+        description="各水源初始储水与库容（须恰好覆盖所有水源）",
+    )
+    periods: list[SchedulePeriodIn] = Field(
+        min_length=1,
+        description="非空有序时段；每期恰好列出全部水源补水与全部用水点需求",
+    )
+
+
 class RestoreStepIn(StrictModel):
     """复水计划中的单步：对某只阀门执行开/关。
 
